@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  server:
+    name: Server
+    runs-on: ubuntu-latest
+    strategy:
+      # Si una zona falla, igual interesa ver si la otra pasa: eso es lo que
+      # distingue "se rompió la lógica" de "se rompió por la zona horaria".
+      fail-fast: false
+      matrix:
+        # Los horarios de atención se calculan en la zona del NEGOCIO, no en la
+        # del server. Correr la suite también en UTC es la red que evita que
+        # vuelva el bug de los turnos corridos (los runners de GitHub son UTC,
+        # igual que Render o Railway; la máquina de desarrollo no).
+        timezone: [America/Argentina/Buenos_Aires, UTC]
+    defaults:
+      run:
+        working-directory: server
+    env:
+      TZ: ${{ matrix.timezone }}
+      # prisma.config.ts exige DATABASE_CONNECTION solo para poder leerse.
+      # `prisma generate` no se conecta a ninguna base y los tests mockean
+      # Prisma entero, así que una URL de mentira alcanza: CI no necesita
+      # levantar Postgres.
+      DATABASE_CONNECTION: postgresql://ci:ci@localhost:5432/ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      # El cliente de Prisma se genera en server/generated/, que está en
+      # .gitignore: en un checkout limpio no existe hasta que se corre esto.
+      - name: Generar el cliente de Prisma
+        run: npx prisma generate
+
+      - name: Tests
+        run: npm test
+
+  client:
+    name: Client
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      # Sin NEXT_PUBLIC_API_URL el build usa el fallback a localhost, que para
+      # compilar alcanza: acá solo interesa que no haya errores de código.
+      - name: Build
+        run: npm run build

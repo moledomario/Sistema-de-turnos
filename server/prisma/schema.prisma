@@ -1,0 +1,200 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model appointment {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  professional_service_id String              @db.Uuid
+  professional_service    ProfessionalService @relation(fields: [professional_service_id], references: [id])
+
+  client_id String @db.Uuid
+  client    user   @relation("ClientAppointments", fields: [client_id], references: [id])
+
+  professional_id String @db.Uuid
+  professional    user   @relation("ProfessionalAppointments", fields: [professional_id], references: [id])
+
+  start_time DateTime
+  end_time   DateTime
+  notes      String?
+  // Comprobante de la transferencia de la seña que subió el cliente, si el
+  // servicio la pedía. Data URL, igual que la foto del servicio.
+  deposit_receipt String?
+  status     Status   @default(PENDING)
+  created_at DateTime @default(now()) @db.Timestamp(6)
+  updated_at DateTime @updatedAt @db.Timestamp(6)
+}
+
+model service {
+  id                  String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                String
+  description         String?
+  professionalService ProfessionalService[]
+  created_at          DateTime              @default(now()) @db.Timestamp(6)
+  updated_at          DateTime              @updatedAt @db.Timestamp(6)
+}
+
+model ProfessionalService {
+  id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id      String        @db.Uuid
+  user         user          @relation(fields: [user_id], references: [id])
+  service_id   String        @db.Uuid
+  service      service       @relation(fields: [service_id], references: [id])
+  duration     Int
+  price        Int?
+  // Foto opcional del servicio, guardada como data URL (base64). El navegador la
+  // redimensiona antes de subirla para que no crezca sin control.
+  image        String?
+  // Si el servicio pide seña: cuánto hay que transferir y a qué cuenta (alias,
+  // CBU, titular, tal cual lo escribió el profesional). El monto es nullable
+  // porque las señas cargadas antes de que existiera el campo no lo tienen.
+  requires_deposit Boolean  @default(false)
+  deposit_amount   Int?
+  bank_details     String?
+  created_at   DateTime      @default(now()) @db.Timestamp(6)
+  updated_at   DateTime      @updatedAt @db.Timestamp(6)
+  appointments appointment[]
+}
+
+model user {
+  id           String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String                @unique
+  password     String
+  firts_name   String
+  last_name    String
+  phone        String?
+  role         Role                  @default(USER)
+  slug         String?               @unique
+  // Foto del local (o personal) y una descripción de a qué se dedica. Se muestra
+  // en el panel y en el link público de reserva. La foto es data URL, como el
+  // resto de las imágenes del proyecto.
+  image        String?
+  description  String?
+  // Si está en true, los turnos que reserven con este profesional entran
+  // CONFIRMED directo, sin pasar por la sección de solicitudes.
+  auto_accept  Boolean               @default(false)
+  // Reglas de reserva, todas configurables desde el panel:
+  // cuánta antelación mínima necesita un turno para poder reservarse,
+  min_notice_hours    Int            @default(0)
+  // con cuántos días de anticipación como máximo se puede reservar,
+  max_days_ahead      Int            @default(60)
+  // y hasta cuántas horas antes el cliente puede cancelar solo.
+  cancel_notice_hours Int            @default(0)
+  // Si está en false, no le llega el mail de turno nuevo (igual lo ve en el panel).
+  notify_on_booking   Boolean        @default(true)
+  // Recuperación de contraseña: se guarda el hash del token, nunca el token que
+  // viaja en el mail, para que ni con la base en la mano se pueda usar el link.
+  reset_token_hash    String?
+  reset_token_expires DateTime?
+  // Link mágico para que el cliente entre a ver sus turnos. Va aparte del token
+  // de recuperación a propósito: son flujos distintos (el cliente no tiene ni
+  // elige contraseña) y compartir el campo haría que pedir uno invalidara el
+  // otro. Acá también se guarda solo el hash.
+  magic_token_hash    String?
+  magic_token_expires DateTime?
+  // Plan contratado. Qué features le tocan sale de acá; si además está PAGO lo
+  // dice subscription_status, que son dos cosas distintas a propósito: alguien
+  // puede estar en EQUIPO con la suscripción vencida.
+  plan         Plan                  @default(INDIVIDUAL)
+  // Suscripción de Mercado Pago (preapproval). El id es la referencia para
+  // buscarla cuando llega un webhook, y es único porque una suscripción de MP
+  // pertenece a una sola cuenta.
+  mp_preapproval_id         String?            @unique
+  subscription_status       SubscriptionStatus @default(NONE)
+  // Próximo débito según MP. Es informativo (se muestra en Cuenta): el permiso
+  // lo da el status, no esta fecha.
+  subscription_next_payment DateTime?
+  // Última vez que se releyó el estado desde Mercado Pago. Existe para no
+  // pedirle a MP en cada carga de página: sin esto, la resincronización al
+  // leer sería una llamada a su API por cada vez que alguien abre Cuenta.
+  subscription_synced_at    DateTime?
+  // Mientras esté en false, al profesional se lo manda al onboarding en vez del
+  // panel. Las cuentas que ya existían quedaron en true en la migración.
+  onboarding_completed Boolean       @default(false)
+  service      ProfessionalService[]
+  availability availability[]
+  team         TeamMember[]
+
+  appointments_as_client    appointment[] @relation("ClientAppointments")
+  appointments_as_professional appointment[] @relation("ProfessionalAppointments")
+
+  created_at   DateTime @default(now()) @db.Timestamp(6)
+  updated_at   DateTime @updatedAt @db.Timestamp(6)
+}
+
+model availability {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id       String   @db.Uuid
+  user          user     @relation(fields: [user_id], references: [id])
+  weekday       Int // 0=domingo ... 6=sábado, igual que Date.prototype.getDay()
+  start_minutes Int // minutos desde medianoche, ej. 9:00 = 540
+  end_minutes   Int // ej. 18:00 = 1080
+  created_at    DateTime @default(now()) @db.Timestamp(6)
+  updated_at    DateTime @updatedAt @db.Timestamp(6)
+
+  @@index([user_id, weekday])
+}
+
+// El equipo que el dueño de la cuenta muestra como suyo. Ojo con el nombre: en
+// la UI son "los profesionales", pero no son usuarios ni tienen agenda propia
+// (los turnos siguen siendo de la cuenta). Por ahora son datos de presentación.
+model TeamMember {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  account_id  String   @db.Uuid
+  account     user     @relation(fields: [account_id], references: [id])
+  name        String
+  description String?
+  // Foto como data URL (base64), igual que la de los servicios.
+  image       String?
+  created_at  DateTime @default(now()) @db.Timestamp(6)
+  updated_at  DateTime @updatedAt @db.Timestamp(6)
+
+  @@index([account_id])
+}
+
+enum Role {
+  USER
+  PROFESSIONAL
+  ADMIN
+}
+
+enum Plan {
+  INDIVIDUAL
+  EQUIPO
+  NEGOCIO
+}
+
+// Espejo de los estados de un preapproval de Mercado Pago, con un valor extra
+// para "nunca se suscribió". Ojo: MP escribe el cancelado como `canceled` (una
+// sola L); la traducción a estos nombres se hace en un solo lugar
+// (mapPreapprovalStatus) para que la diferencia no se filtre al resto.
+enum SubscriptionStatus {
+  NONE
+  // Creada, esperando que el profesional cargue la tarjeta en el checkout de MP.
+  PENDING
+  // Con medio de pago válido: es el único estado que habilita el cobro al día.
+  AUTHORIZED
+  PAUSED
+  CANCELLED
+}
+
+enum Status {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  // Un turno confirmado cuyo horario ya pasó se cierra solo en COMPLETED (ver
+  // closePastAppointments): se asume que se atendió, que es lo habitual.
+  COMPLETED
+  // La excepción, que el profesional marca a mano desde el panel. Existe para
+  // poder distinguir "pasó y se atendió" de "pasó y no vino": sin esto el
+  // historial mezcla las dos cosas y no hay forma de medir ausentismo.
+  NO_SHOW
+}

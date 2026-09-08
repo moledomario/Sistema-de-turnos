@@ -19,7 +19,6 @@ export const PANEL_NAV_ITEMS = [
     // Ícono genérico a propósito: la app la usan profesionales de cualquier
     // rubro, no solo peluquerías.
     { title: "Servicios", href: "/panel/servicios", icon: Briefcase },
-    { title: "Precios", href: "/panel/precios", icon: Tag },
 ];
 
 // Van en su propio grupo del sidebar ("Cuenta"), separados de la operación diaria.

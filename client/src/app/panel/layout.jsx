@@ -3,6 +3,7 @@ import { Separator } from "@/components/ui/separator";
 import { AppSidebar } from "@/components/app-sidebar";
 import PanelGuard from "./PanelGuard";
 import PanelHeaderTitle from "./PanelHeaderTitle";
+import TrialBanner from "./TrialBanner";
 import { PendingRequestsProvider } from "./PendingRequestsContext";
 
 export default function PanelLayout({ children }) {
@@ -17,6 +18,10 @@ export default function PanelLayout({ children }) {
                         <PanelHeaderTitle />
                     </header>
                     <div className="flex-1 overflow-auto">
+                        {/* Va afuera del guard a propósito: el guard no rinde
+                            nada mientras carga o si falta el onboarding, y el
+                            aviso de la prueba tiene que verse igual. */}
+                        <TrialBanner />
                         <PanelGuard>{children}</PanelGuard>
                     </div>
                 </SidebarInset>

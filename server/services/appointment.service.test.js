@@ -12,7 +12,7 @@ vi.mock('../src/lib/prisma.js', () => ({
         professionalService: { findFirst: vi.fn(), findMany: vi.fn() },
         appointment: { findMany: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
         availability: { findMany: vi.fn() },
-        user: { findMany: vi.fn(), findUnique: vi.fn() },
+        user: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn() },
     },
 }));
 
@@ -31,6 +31,7 @@ const { notifyProfessionalOfBooking, notifyClientOfConfirmation } = await import
 const {
     createAppointmentService,
     getAvailableSlotsService,
+    getProfessionalBySlugService,
     cancelAppointmentService,
     rescheduleAppointmentService,
     closePastAppointments,
@@ -45,6 +46,21 @@ const LUNES = '2026-08-03';
 // horario del día cuenta como futuro.
 const AHORA = new Date(`${LUNES}T08:00:00-03:00`);
 
+// Una cuenta que puede recibir turnos, por estar dentro de la prueba gratis.
+// Sin estos dos campos el servicio la lee como vencida y no toma ninguna
+// reserva, así que todo override del mock de `user.findUnique` los tiene que
+// incluir (por eso está como objeto para spreadear y no suelto en el default).
+const CON_ACCESO = {
+    subscription_status: 'NONE',
+    trial_ends_at: new Date(AHORA.getTime() + 7 * 24 * 60 * 60 * 1000),
+};
+
+// La misma cuenta con la prueba vencida y sin haber pagado nunca.
+const SIN_ACCESO = {
+    subscription_status: 'NONE',
+    trial_ends_at: new Date(AHORA.getTime() - 24 * 60 * 60 * 1000),
+};
+
 beforeEach(() => {
     vi.clearAllMocks();
     // El reloj va congelado para TODO el archivo. Sin esto, las fechas fijas de
@@ -57,6 +73,7 @@ beforeEach(() => {
     // deja reservar con dos meses de anticipación (los valores que trae una
     // cuenta nueva). Cada select del servicio lee solo lo suyo de este objeto.
     prisma.user.findUnique.mockResolvedValue({
+        ...CON_ACCESO,
         auto_accept: false,
         min_notice_hours: 0,
         max_days_ahead: 60,
@@ -82,7 +99,7 @@ describe('getAvailableSlotsService', () => {
     });
 
     it('devuelve [] sin consultar turnos si no hay ventana de disponibilidad ese día', async () => {
-        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30, team_member_id: 'miembro1' });
         prisma.availability.findMany.mockResolvedValue([]);
 
         const slots = await getAvailableSlotsService('prof', 'svc', '2026-08-03');
@@ -99,7 +116,7 @@ describe('getAvailableSlotsService', () => {
         vi.useFakeTimers();
         vi.setSystemTime(new Date(dayStart.getTime() - 24 * 60 * 60 * 1000)); // el día anterior
 
-        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30, team_member_id: 'miembro1' });
         prisma.availability.findMany.mockResolvedValue([
             { weekday, start_minutes: 540, end_minutes: 600 }, // 09:00 a 10:00
         ]);
@@ -124,7 +141,7 @@ describe('getAvailableSlotsService', () => {
         vi.useFakeTimers();
         vi.setSystemTime(new Date(dayStart.getTime() - 24 * 60 * 60 * 1000));
 
-        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30, team_member_id: 'miembro1' });
         prisma.availability.findMany.mockResolvedValue([
             { weekday, start_minutes: 540, end_minutes: 600 },
         ]);
@@ -151,7 +168,7 @@ describe('getAvailableSlotsService', () => {
         // pero 9 minutos antes de que empiece el de las 09:30 (570 min).
         vi.setSystemTime(new Date(dayStart.getTime() + 561 * 60 * 1000));
 
-        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30, team_member_id: 'miembro1' });
         prisma.availability.findMany.mockResolvedValue([
             { weekday, start_minutes: 540, end_minutes: 600 },
         ]);
@@ -164,7 +181,7 @@ describe('getAvailableSlotsService', () => {
     });
 
     it('pasa status: not CANCELLED al buscar turnos existentes (no deben bloquear el slot)', async () => {
-        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ duration: 30, team_member_id: 'miembro1' });
         prisma.availability.findMany.mockResolvedValue([{ weekday: 0, start_minutes: 540, end_minutes: 600 }]);
         prisma.appointment.findMany.mockResolvedValue([]);
 
@@ -193,7 +210,7 @@ describe('createAppointmentService', () => {
     });
 
     it('lanza error si ya existe un turno en ese horario', async () => {
-        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', team_member_id: 'miembro1', duration: 30 });
         prisma.appointment.findMany.mockResolvedValue([{ id: 'other' }]);
 
         await expect(
@@ -219,7 +236,7 @@ describe('createAppointmentService', () => {
         ];
 
         const reservar = (start, duration = 30) => {
-            prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', duration });
+            prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', team_member_id: 'miembro1', duration });
             prisma.appointment.findMany.mockResolvedValue([]);
             prisma.appointment.create.mockImplementation(({ data }) => Promise.resolve({ id: 'new', ...data }));
             return createAppointmentService({
@@ -267,8 +284,10 @@ describe('createAppointmentService', () => {
 
             await reservar(new Date('2026-08-03T10:00:00-03:00'));
 
+            // La atención es del miembro que presta el servicio, no de la
+            // cuenta: en un equipo cada uno tiene su propio horario.
             expect(prisma.availability.findMany).toHaveBeenCalledWith({
-                where: { user_id: 'prof', weekday: 1 },
+                where: { team_member_id: 'miembro1', weekday: 1 },
             });
         });
     });
@@ -307,6 +326,7 @@ describe('createAppointmentService', () => {
 
         it('rechaza un turno con menos antelación que la mínima', async () => {
             prisma.user.findUnique.mockResolvedValue({
+                ...CON_ACCESO,
                 auto_accept: false,
                 min_notice_hours: 24,
                 max_days_ahead: 60,
@@ -318,6 +338,7 @@ describe('createAppointmentService', () => {
 
         it('acepta el turno una vez pasada la antelación mínima', async () => {
             prisma.user.findUnique.mockResolvedValue({
+                ...CON_ACCESO,
                 auto_accept: false,
                 min_notice_hours: 24,
                 max_days_ahead: 60,
@@ -328,6 +349,7 @@ describe('createAppointmentService', () => {
 
         it('rechaza un turno más allá del máximo de días', async () => {
             prisma.user.findUnique.mockResolvedValue({
+                ...CON_ACCESO,
                 auto_accept: false,
                 min_notice_hours: 0,
                 max_days_ahead: 30,
@@ -369,9 +391,9 @@ describe('createAppointmentService', () => {
     });
 
     it('deja el turno PENDING y solo avisa al profesional si no tiene auto_accept', async () => {
-        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', team_member_id: 'miembro1', duration: 30 });
         prisma.appointment.findMany.mockResolvedValue([]);
-        prisma.user.findUnique.mockResolvedValue({ auto_accept: false });
+        prisma.user.findUnique.mockResolvedValue({ ...CON_ACCESO, auto_accept: false });
         prisma.appointment.create.mockImplementation(({ data }) => Promise.resolve({ id: 'new', ...data }));
 
         const result = await createAppointmentService({
@@ -387,9 +409,9 @@ describe('createAppointmentService', () => {
     });
 
     it('confirma el turno y avisa a las dos partes si el profesional tiene auto_accept', async () => {
-        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', team_member_id: 'miembro1', duration: 30 });
         prisma.appointment.findMany.mockResolvedValue([]);
-        prisma.user.findUnique.mockResolvedValue({ auto_accept: true });
+        prisma.user.findUnique.mockResolvedValue({ ...CON_ACCESO, auto_accept: true });
         prisma.appointment.create.mockImplementation(({ data }) => Promise.resolve({ id: 'new', ...data }));
 
         const result = await createAppointmentService({
@@ -405,7 +427,7 @@ describe('createAppointmentService', () => {
     });
 
     it('traduce el error de constraint de superposición a un mensaje amigable', async () => {
-        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', duration: 30 });
+        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', team_member_id: 'miembro1', duration: 30 });
         prisma.appointment.findMany.mockResolvedValue([]);
         prisma.appointment.create.mockRejectedValue(new Error('violates exclusion constraint "appointment_overlap_constraint"'));
 
@@ -417,6 +439,113 @@ describe('createAppointmentService', () => {
                 start_time: new Date('2026-08-03T12:00:00.000Z'),
             })
         ).rejects.toThrow('Ya existe un turno en ese horario');
+    });
+});
+
+// Sin prueba vigente ni suscripción al día, la agenda deja de tomar turnos
+// nuevos. Es lo que hace que la suscripción signifique algo: el link público es
+// el producto, así que si siguiera reservando no habría motivo para pagar.
+describe('un profesional sin acceso no recibe turnos', () => {
+    const reservar = () =>
+        createAppointmentService({
+            professional_id: 'prof',
+            service_id: 'svc',
+            client_id: 'client',
+            start_time: new Date('2026-08-03T12:00:00.000Z'),
+        });
+
+    beforeEach(() => {
+        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', team_member_id: 'miembro1', duration: 30 });
+        prisma.appointment.findMany.mockResolvedValue([]);
+    });
+
+    it('rechaza la reserva con 409 y no crea nada', async () => {
+        prisma.user.findUnique.mockResolvedValue({ ...SIN_ACCESO, auto_accept: false });
+
+        await expect(reservar()).rejects.toMatchObject({ status: 409 });
+        expect(prisma.appointment.create).not.toHaveBeenCalled();
+    });
+
+    // El cliente no tiene por qué enterarse de que el profesional no pagó.
+    it('el mensaje no dice nada de la suscripción', async () => {
+        prisma.user.findUnique.mockResolvedValue({ ...SIN_ACCESO, auto_accept: false });
+
+        await expect(reservar()).rejects.toThrow('no está recibiendo turnos');
+    });
+
+    // Si primero se validara el horario, alguien con la agenda cerrada leería
+    // "ese horario ya pasó" y probaría otro, y otro, sin entender nunca por qué.
+    it('avisa que no recibe turnos antes de mirar el horario', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+            ...SIN_ACCESO,
+            auto_accept: false,
+            min_notice_hours: 48,
+            max_days_ahead: 60,
+        });
+
+        await expect(reservar()).rejects.toThrow('no está recibiendo turnos');
+    });
+
+    it('con la suscripción al día sí reserva, aunque la prueba haya vencido', async () => {
+        prisma.user.findUnique.mockResolvedValue({
+            ...SIN_ACCESO,
+            subscription_status: 'AUTHORIZED',
+            auto_accept: false,
+        });
+        prisma.appointment.create.mockImplementation(({ data }) => Promise.resolve({ id: 'new', ...data }));
+
+        await expect(reservar()).resolves.toBeTruthy();
+    });
+
+    it('no ofrece ningún horario disponible', async () => {
+        prisma.professionalService.findFirst.mockResolvedValue({ id: 'ps1', user_id: 'prof', team_member_id: 'miembro1', duration: 30 });
+        prisma.availability.findMany.mockResolvedValue([{ start_minutes: 0, end_minutes: 1440 }]);
+        prisma.user.findUnique.mockResolvedValue({
+            ...SIN_ACCESO,
+            min_notice_hours: 0,
+            max_days_ahead: 60,
+        });
+
+        await expect(getAvailableSlotsService('prof', 'svc', LUNES)).resolves.toEqual([]);
+    });
+});
+
+describe('getProfessionalBySlugService', () => {
+    beforeEach(() => {
+        prisma.professionalService.findMany.mockResolvedValue([]);
+    });
+
+    const buscar = (acceso) => {
+        prisma.user.findFirst.mockResolvedValue({
+            id: 'prof',
+            firts_name: 'Ana',
+            last_name: 'Diaz',
+            phone: null,
+            slug: 'ana-diaz',
+            image: null,
+            description: null,
+            ...acceso,
+        });
+        return getProfessionalBySlugService('ana-diaz');
+    };
+
+    it('marca accepting_bookings en true si la cuenta está al día', async () => {
+        const { professional } = await buscar(CON_ACCESO);
+        expect(professional.accepting_bookings).toBe(true);
+    });
+
+    it('lo marca en false si venció y no pagó', async () => {
+        const { professional } = await buscar(SIN_ACCESO);
+        expect(professional.accepting_bookings).toBe(false);
+    });
+
+    // Este endpoint lo abre cualquiera con el link, sin sesión: en qué anda el
+    // profesional con su factura no es información del cliente.
+    it('no filtra los campos de suscripción al responder', async () => {
+        const { professional } = await buscar(SIN_ACCESO);
+
+        expect(professional).not.toHaveProperty('subscription_status');
+        expect(professional).not.toHaveProperty('trial_ends_at');
     });
 });
 

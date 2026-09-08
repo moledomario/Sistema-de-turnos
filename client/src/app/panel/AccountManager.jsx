@@ -5,8 +5,6 @@ import Link from "next/link";
 import { getMyAccount, updateMyAccount } from "../lib/api";
 import Avatar from "../components/Avatar";
 import ImageField from "../components/ImageField";
-import SubscriptionCard from "./SubscriptionCard";
-
 const ROLE_LABELS = {
     PROFESSIONAL: "Profesional",
     ADMIN: "Administrador",
@@ -251,7 +249,7 @@ export default function AccountManager({ token }) {
                 )}
             </div>
 
-            <SubscriptionCard token={token} />
+         
         </section>
     );
 }

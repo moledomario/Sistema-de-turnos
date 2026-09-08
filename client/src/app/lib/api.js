@@ -167,7 +167,17 @@ async function panelRequest(path, token, options = {}) {
     if (response.status === 204) return null;
     const data = await parseJsonSafe(response);
     if (!response.ok) {
-        throw new Error(data?.message || "Error en el panel");
+        const error = new Error(data?.message || "Error en el panel");
+        // 402 es "falta pagar", no "algo salió mal": el server lo devuelve
+        // cuando la prueba venció y no hay suscripción activa. Se marca acá,
+        // en el único lugar por donde pasan todas las llamadas del panel, para
+        // que cada pantalla pueda ofrecer el link a suscribirse en vez de
+        // mostrar un cartel rojo genérico.
+        if (response.status === 402) {
+            error.paymentRequired = true;
+            error.reason = data?.reason;
+        }
+        throw error;
     }
     return data;
 }

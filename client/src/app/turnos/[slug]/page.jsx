@@ -23,6 +23,45 @@ export default async function ProfessionalServicePage({ params }) {
 
     const { professional, services } = data;
 
+    // El profesional dejó de recibir turnos (se le venció la prueba o no tiene
+    // la suscripción al día). Se muestra su perfil igual —el link puede estar
+    // guardado o compartido— pero sin la grilla de servicios, porque cualquier
+    // horario que eligiera el cliente terminaría rebotando en el alta.
+    //
+    // El motivo no se cuenta: para el cliente esto es "hoy no está tomando
+    // turnos", y la situación de un profesional con su factura no es asunto suyo.
+    if (!professional.accepting_bookings) {
+        return (
+            <main className="mx-auto max-w-2xl px-4 py-10">
+                <div className="flex flex-col items-center">
+                    <Avatar
+                        firstName={professional.firts_name}
+                        lastName={professional.last_name}
+                        image={professional.image}
+                        size={88}
+                    />
+                    <h1 className="text-2xl font-semibold text-slate-900 text-center mt-3">
+                        {professional.firts_name} {professional.last_name}
+                    </h1>
+                    <div className="mt-6 w-full rounded-xl border border-slate-200 bg-white p-6 text-center shadow-sm">
+                        <p className="text-slate-700">
+                            No está recibiendo turnos en este momento.
+                        </p>
+                        <p className="mt-2 text-sm text-slate-500">
+                            Si ya tenías uno reservado, sigue en pie. Para consultar,
+                            contactate directamente.
+                        </p>
+                        {professional.phone && (
+                            <p className="mt-3 text-sm font-medium text-slate-700">
+                                {professional.phone}
+                            </p>
+                        )}
+                    </div>
+                </div>
+            </main>
+        );
+    }
+
     return (
         <main className="mx-auto max-w-4xl px-4 py-10">
             <Stepper current={1} />

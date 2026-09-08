@@ -8,6 +8,7 @@ process.env.APP_TIMEZONE = 'America/Argentina/Buenos_Aires';
 vi.mock('../src/lib/prisma.js', () => ({
     prisma: {
         appointment: {
+            count: vi.fn(),
             findMany: vi.fn(),
             findFirst: vi.fn(),
             findUnique: vi.fn(),
@@ -16,6 +17,7 @@ vi.mock('../src/lib/prisma.js', () => ({
             updateMany: vi.fn(),
         },
         user: { findUnique: vi.fn(), update: vi.fn() },
+        teamMember: { findFirst: vi.fn(), findMany: vi.fn(), count: vi.fn(), create: vi.fn(), update: vi.fn() },
         availability: {
             findMany: vi.fn(),
             create: vi.fn(),
@@ -68,11 +70,24 @@ const {
     rescheduleBookingService,
     createBookingService,
     setAttendanceService,
+    createTeamMemberService,
+    deleteTeamMemberService,
+    getMyTeamService,
 } = await import('./panel.service.js');
 const { findOrCreateManualClientService } = await import('./client.service.js');
 
 beforeEach(() => {
     vi.clearAllMocks();
+    // Sin `member_id`, los services caen en el miembro dueño de la cuenta
+    // (resolveMember). Es el caso por defecto —una cuenta que trabaja sola— así
+    // que se deja mockeado para todos los tests; el que quiera probar con otro
+    // miembro lo pisa.
+    prisma.teamMember.findFirst.mockResolvedValue({
+        id: 'miembro1',
+        account_id: 'prof1',
+        is_owner: true,
+        is_active: true,
+    });
 });
 
 describe('getPendingRequestsService', () => {
@@ -271,12 +286,12 @@ describe('replaceAvailabilityDayService', () => {
 
         expect(prisma.$transaction).toHaveBeenCalledTimes(1);
         expect(prisma.availability.deleteMany).toHaveBeenCalledWith({
-            where: { user_id: 'prof1', weekday: 1 },
+            where: { team_member_id: 'miembro1', weekday: 1 },
         });
         expect(prisma.availability.createMany).toHaveBeenCalledWith({
             data: [
-                { start_minutes: 540, end_minutes: 780, user_id: 'prof1', weekday: 1 },
-                { start_minutes: 960, end_minutes: 1200, user_id: 'prof1', weekday: 1 },
+                { start_minutes: 540, end_minutes: 780, user_id: 'prof1', team_member_id: 'miembro1', weekday: 1 },
+                { start_minutes: 960, end_minutes: 1200, user_id: 'prof1', team_member_id: 'miembro1', weekday: 1 },
             ],
         });
     });
@@ -287,7 +302,7 @@ describe('replaceAvailabilityDayService', () => {
         const result = await replaceAvailabilityDayService('prof1', 3, []);
 
         expect(prisma.availability.deleteMany).toHaveBeenCalledWith({
-            where: { user_id: 'prof1', weekday: 3 },
+            where: { team_member_id: 'miembro1', weekday: 3 },
         });
         expect(prisma.availability.createMany).toHaveBeenCalledWith({ data: [] });
         expect(result.availability).toEqual([]);
@@ -303,7 +318,7 @@ describe('replaceAvailabilityDayService', () => {
         const result = await replaceAvailabilityDayService('prof1', 1, []);
 
         expect(prisma.availability.findMany).toHaveBeenCalledWith({
-            where: { user_id: 'prof1', weekday: 1 },
+            where: { team_member_id: 'miembro1', weekday: 1 },
             orderBy: { start_minutes: 'asc' },
         });
         expect(result.availability).toBe(saved);
@@ -366,7 +381,7 @@ describe('replaceAvailabilityDayService', () => {
             expect(conflicts).toEqual([]);
         });
 
-        it('solo mira turnos futuros y no cancelados del profesional', async () => {
+        it('solo mira turnos futuros y no cancelados de ese miembro', async () => {
             prisma.appointment.findMany.mockResolvedValue([]);
 
             await replaceAvailabilityDayService('prof1', 1, []);
@@ -374,7 +389,9 @@ describe('replaceAvailabilityDayService', () => {
             expect(prisma.appointment.findMany).toHaveBeenCalledWith(
                 expect.objectContaining({
                     where: expect.objectContaining({
-                        professional_id: 'prof1',
+                        // Del miembro: cambiarle el horario a uno no tiene por
+                        // qué avisar de los turnos de sus compañeros.
+                        team_member_id: 'miembro1',
                         status: { not: 'CANCELLED' },
                         start_time: { gte: expect.any(Date) },
                     }),
@@ -751,5 +768,133 @@ describe('setAttendanceService', () => {
         await setAttendanceService('prof1', 'appt1', false);
 
         expect(notifyInBackground).not.toHaveBeenCalled();
+    });
+});
+
+// El equipo es lo que diferencia a un plan de otro, así que el tope y quién
+// puede darse de baja son reglas de negocio, no detalles de UI.
+describe('equipo: alta de profesionales', () => {
+    const cuenta = (plan, acceso) => {
+        prisma.user.findUnique.mockResolvedValue({
+            plan,
+            subscription_status: acceso === 'pago' ? 'AUTHORIZED' : 'NONE',
+            // Prueba vigente cuando no está pagando.
+            trial_ends_at: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
+        });
+    };
+
+    it('en la prueba deja armar equipo aunque el plan sea INDIVIDUAL', async () => {
+        // Si se respetara el plan (que arranca en INDIVIDUAL), nadie podría
+        // probar la función de equipo antes de pagarla, que es justo lo que
+        // tiene que poder evaluar durante la prueba.
+        cuenta('INDIVIDUAL', 'prueba');
+        prisma.teamMember.count.mockResolvedValue(3);
+        prisma.teamMember.create.mockResolvedValue({ id: 'm2' });
+
+        await expect(createTeamMemberService('prof1', { name: 'Ana' })).resolves.toBeTruthy();
+    });
+
+    it('corta en el tope de la prueba', async () => {
+        cuenta('INDIVIDUAL', 'prueba');
+        prisma.teamMember.count.mockResolvedValue(5);
+
+        await expect(createTeamMemberService('prof1', { name: 'Ana' })).rejects.toMatchObject({ status: 409 });
+        expect(prisma.teamMember.create).not.toHaveBeenCalled();
+    });
+
+    it('pagando INDIVIDUAL, un solo profesional', async () => {
+        cuenta('INDIVIDUAL', 'pago');
+        prisma.teamMember.count.mockResolvedValue(1);
+
+        await expect(createTeamMemberService('prof1', { name: 'Ana' })).rejects.toThrow('un solo profesional');
+    });
+
+    it('pagando EQUIPO entra el quinto y no el sexto', async () => {
+        cuenta('EQUIPO', 'pago');
+
+        prisma.teamMember.count.mockResolvedValue(4);
+        prisma.teamMember.create.mockResolvedValue({ id: 'm5' });
+        await expect(createTeamMemberService('prof1', { name: 'Quinta' })).resolves.toBeTruthy();
+
+        prisma.teamMember.count.mockResolvedValue(5);
+        await expect(createTeamMemberService('prof1', { name: 'Sexta' })).rejects.toMatchObject({ status: 409 });
+    });
+
+    it('pagando NEGOCIO no hay tope y no se cuenta nada', async () => {
+        cuenta('NEGOCIO', 'pago');
+        prisma.teamMember.create.mockResolvedValue({ id: 'm99' });
+
+        await expect(createTeamMemberService('prof1', { name: 'Nº 100' })).resolves.toBeTruthy();
+        expect(prisma.teamMember.count).not.toHaveBeenCalled();
+    });
+
+    // Los dados de baja siguen en la base por sus turnos históricos, pero el
+    // lugar que ocupaban queda libre.
+    it('los dados de baja no ocupan lugar', async () => {
+        cuenta('EQUIPO', 'pago');
+        prisma.teamMember.count.mockResolvedValue(2);
+        prisma.teamMember.create.mockResolvedValue({ id: 'm3' });
+
+        await createTeamMemberService('prof1', { name: 'Ana' });
+
+        expect(prisma.teamMember.count).toHaveBeenCalledWith({
+            where: { account_id: 'prof1', is_active: true },
+        });
+    });
+});
+
+describe('equipo: baja de profesionales', () => {
+    it('no deja dar de baja al dueño', async () => {
+        prisma.teamMember.findFirst.mockResolvedValue({
+            id: 'm1', account_id: 'prof1', is_owner: true, is_active: true,
+        });
+
+        await expect(deleteTeamMemberService('prof1', 'm1')).rejects.toThrow('tu propia ficha');
+        expect(prisma.teamMember.update).not.toHaveBeenCalled();
+    });
+
+    it('no deja dar de baja a alguien con turnos por delante', async () => {
+        prisma.teamMember.findFirst.mockResolvedValue({
+            id: 'm2', account_id: 'prof1', is_owner: false, is_active: true,
+        });
+        prisma.appointment.count.mockResolvedValue(3);
+
+        await expect(deleteTeamMemberService('prof1', 'm2')).rejects.toMatchObject({ status: 409 });
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    // Baja lógica, no borrado: sus turnos pasados son historial del negocio.
+    it('sin turnos activos lo desactiva y le borra los horarios', async () => {
+        prisma.teamMember.findFirst.mockResolvedValue({
+            id: 'm2', account_id: 'prof1', is_owner: false, is_active: true,
+        });
+        prisma.appointment.count.mockResolvedValue(0);
+
+        await deleteTeamMemberService('prof1', 'm2');
+
+        expect(prisma.availability.deleteMany).toHaveBeenCalledWith({ where: { team_member_id: 'm2' } });
+        expect(prisma.teamMember.update).toHaveBeenCalledWith({
+            where: { id: 'm2' },
+            data: { is_active: false },
+        });
+    });
+
+    it('un miembro de otra cuenta da 404', async () => {
+        prisma.teamMember.findFirst.mockResolvedValue(null);
+
+        await expect(deleteTeamMemberService('prof1', 'ajeno')).rejects.toMatchObject({ status: 404 });
+    });
+});
+
+describe('getMyTeamService', () => {
+    it('lista solo los activos, con el dueño primero', async () => {
+        prisma.teamMember.findMany.mockResolvedValue([]);
+
+        await getMyTeamService('prof1');
+
+        expect(prisma.teamMember.findMany).toHaveBeenCalledWith({
+            where: { account_id: 'prof1', is_active: true },
+            orderBy: [{ is_owner: 'desc' }, { created_at: 'asc' }],
+        });
     });
 });

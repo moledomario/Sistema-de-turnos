@@ -1,6 +1,8 @@
 import bcrypt from 'bcryptjs';
 import { prisma } from '../src/lib/prisma.js';
 import { weekdayOf, fitsInWindows } from '../src/lib/schedule.js';
+import { accessSelect, getAccessState } from '../src/lib/access.js';
+import { maxMembersFor } from '../src/lib/plans.js';
 import { findOrCreateManualClientService } from './client.service.js';
 import { closePastAppointments } from './appointment.service.js';
 import {
@@ -12,26 +14,59 @@ import {
     notifyInBackground,
 } from './notification.service.js';
 
-const getMyAvailabilityService = async (userId) => {
+// A qué profesional del equipo apunta la operación.
+//
+// Sin `memberId` se asume el dueño. Eso es lo que hace que una cuenta que
+// trabaja sola no tenga que elegir nada nunca (su equipo es de uno), y que el
+// onboarding y cualquier llamada vieja sigan funcionando sin cambios.
+//
+// Siempre pasa por findOwnTeamMember, así que un id de otra cuenta da 404 y
+// nunca se llega a escribir una fila con la cuenta y el miembro desalineados.
+const resolveMember = async (userId, memberId) => {
+    if (memberId) return findOwnTeamMember(userId, memberId);
+
+    const owner = await prisma.teamMember.findFirst({
+        where: { account_id: userId, is_owner: true },
+    });
+
+    if (!owner) {
+        // No debería pasar: la migración le creó el dueño a toda cuenta y el
+        // registro se lo crea a las nuevas. Si pasa, es un bug nuestro y no
+        // algo que el profesional pueda arreglar.
+        const error = new Error('Tu cuenta no tiene un profesional principal');
+        error.status = 500;
+        throw error;
+    }
+
+    return owner;
+};
+
+const getMyAvailabilityService = async (userId, memberId) => {
+    const member = await resolveMember(userId, memberId);
+
     return prisma.availability.findMany({
-        where: { user_id: userId },
+        where: { team_member_id: member.id },
         orderBy: [{ weekday: 'asc' }, { start_minutes: 'asc' }],
     });
 };
 
-const createAvailabilityService = async (userId, data) => {
+const createAvailabilityService = async (userId, data, memberId) => {
+    const member = await resolveMember(userId, memberId);
+
     return prisma.availability.create({
-        data: { ...data, user_id: userId },
+        data: { ...data, user_id: userId, team_member_id: member.id },
     });
 };
 
 // Turnos ya reservados que dejan de entrar en el horario nuevo: si el
 // profesional mete un corte al mediodía o achica el día, esos turnos no se
 // cancelan solos, pero se los devolvemos para poder avisarle.
-const findAppointmentsOutsideDay = async (userId, weekday, ranges) => {
+const findAppointmentsOutsideDay = async (memberId, weekday, ranges) => {
     const upcoming = await prisma.appointment.findMany({
         where: {
-            professional_id: userId,
+            // Del miembro, no de la cuenta: cambiarle el horario a uno no tiene
+            // por qué avisar de los turnos de sus compañeros.
+            team_member_id: memberId,
             status: { not: 'CANCELLED' },
             start_time: { gte: new Date() },
         },
@@ -56,18 +91,24 @@ const findAppointmentsOutsideDay = async (userId, weekday, ranges) => {
 // Reemplaza de una todas las franjas de un día. Es lo que usa el editor de
 // horarios del panel: mandar el día completo evita quedar a mitad de camino
 // entre el horario viejo y el nuevo si falla una de las operaciones.
-const replaceAvailabilityDayService = async (userId, weekday, ranges) => {
-    const conflicts = await findAppointmentsOutsideDay(userId, weekday, ranges);
+const replaceAvailabilityDayService = async (userId, weekday, ranges, memberId) => {
+    const member = await resolveMember(userId, memberId);
+    const conflicts = await findAppointmentsOutsideDay(member.id, weekday, ranges);
 
     await prisma.$transaction([
-        prisma.availability.deleteMany({ where: { user_id: userId, weekday } }),
+        prisma.availability.deleteMany({ where: { team_member_id: member.id, weekday } }),
         prisma.availability.createMany({
-            data: ranges.map((range) => ({ ...range, user_id: userId, weekday })),
+            data: ranges.map((range) => ({
+                ...range,
+                user_id: userId,
+                team_member_id: member.id,
+                weekday,
+            })),
         }),
     ]);
 
     const availability = await prisma.availability.findMany({
-        where: { user_id: userId, weekday },
+        where: { team_member_id: member.id, weekday },
         orderBy: { start_minutes: 'asc' },
     });
 
@@ -76,6 +117,8 @@ const replaceAvailabilityDayService = async (userId, weekday, ranges) => {
 
 const deleteAvailabilityService = async (userId, availabilityId) => {
     const slot = await prisma.availability.findUnique({ where: { id: availabilityId } });
+    // El chequeo sigue siendo contra la cuenta: el dueño administra la agenda
+    // de todo su equipo, así que cualquier franja de su cuenta es suya.
     if (!slot || slot.user_id !== userId) {
         const error = new Error('No se encontró ese horario');
         error.status = 404;
@@ -460,17 +503,58 @@ const completeOnboardingService = async (userId) => {
     });
 };
 
+// Los dados de baja no se listan: siguen en la base por sus turnos históricos,
+// pero para el panel y el link público ya no existen.
 const getMyTeamService = async (userId) => {
     return prisma.teamMember.findMany({
-        where: { account_id: userId },
-        orderBy: { created_at: 'asc' },
+        where: { account_id: userId, is_active: true },
+        // El dueño primero, después por antigüedad: es el orden en que el
+        // profesional espera verse a sí mismo en su propia lista.
+        orderBy: [{ is_owner: 'desc' }, { created_at: 'asc' }],
     });
 };
 
 const createTeamMemberService = async (userId, data) => {
+    const account = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { plan: true, ...accessSelect },
+    });
+
+    const max = maxMembersFor(account, getAccessState(account));
+
+    if (max !== null) {
+        // Solo cuentan los activos: alguien que dio de baja a un profesional
+        // liberó ese lugar, aunque la fila siga existiendo por su historial.
+        const actuales = await prisma.teamMember.count({
+            where: { account_id: userId, is_active: true },
+        });
+
+        if (actuales >= max) {
+            const error = new Error(
+                max === 1
+                    ? 'Tu plan incluye un solo profesional. Pasate a Equipo para sumar más.'
+                    : `Tu plan incluye hasta ${max} profesionales. Pasate a un plan mayor para sumar más.`
+            );
+            error.status = 409;
+            throw error;
+        }
+    }
+
     return prisma.teamMember.create({
         data: { ...data, account_id: userId },
     });
+};
+
+// El dueño no se borra: es el miembro que representa al titular, y si se fuera
+// la cuenta quedaría sin nadie que atienda (y con su agenda colgando de un
+// miembro inexistente). Para "sacarlo de la vidriera" lo que corresponde es
+// dejarlo sin horarios, no eliminarlo.
+const assertNotOwner = (member) => {
+    if (!member.is_owner) return;
+
+    const error = new Error('No podés eliminar tu propia ficha de profesional');
+    error.status = 409;
+    throw error;
 };
 
 // Buscar por id y dueño en el mismo where evita tocar la ficha de otra cuenta.
@@ -497,26 +581,59 @@ const updateTeamMemberService = async (userId, memberId, data) => {
     });
 };
 
+// "Eliminar" un profesional es darlo de baja, no borrarlo: sus turnos pasados
+// son historial del negocio (y la FK no dejaría borrarlo de todos modos).
+// Desaparece del link público y de los selectores, y deja de contar para el
+// límite del plan.
 const deleteTeamMemberService = async (userId, memberId) => {
-    await findOwnTeamMember(userId, memberId);
+    const member = await findOwnTeamMember(userId, memberId);
+    assertNotOwner(member);
 
-    await prisma.teamMember.delete({ where: { id: memberId } });
+    // Los turnos que todavía no pasaron sí frenan la baja: hay clientes con ese
+    // horario reservado y sacarlo del medio en silencio los dejaría colgados.
+    const activos = await prisma.appointment.count({
+        where: { team_member_id: memberId, status: { in: ['PENDING', 'CONFIRMED'] } },
+    });
+
+    if (activos > 0) {
+        const error = new Error(
+            'Ese profesional tiene turnos activos. Cancelalos o reprogramalos antes de darlo de baja.'
+        );
+        error.status = 409;
+        throw error;
+    }
+
+    // Los horarios sí se van: dejan de ofrecerse turnos con esa persona, y no
+    // son un compromiso con nadie. Los servicios quedan, porque los turnos
+    // históricos los referencian.
+    await prisma.$transaction([
+        prisma.availability.deleteMany({ where: { team_member_id: memberId } }),
+        prisma.teamMember.update({ where: { id: memberId }, data: { is_active: false } }),
+    ]);
 };
 
 const getServiceCatalogService = async () => {
     return prisma.service.findMany({ orderBy: { name: 'asc' } });
 };
 
-const getMyServicesService = async (userId) => {
+// Sin `memberId` devuelve los servicios de TODA la cuenta, no solo los del
+// dueño: el panel necesita poder mostrar el catálogo completo del negocio.
+// Con `memberId`, solo los de esa persona.
+const getMyServicesService = async (userId, memberId) => {
+    const where = memberId
+        ? { team_member_id: (await findOwnTeamMember(userId, memberId)).id }
+        : { user_id: userId };
+
     return prisma.professionalService.findMany({
-        where: { user_id: userId },
+        where,
         include: { service: { select: { id: true, name: true, description: true } } },
         orderBy: { created_at: 'asc' },
     });
 };
 
-const createMyServiceService = async (userId, data) => {
+const createMyServiceService = async (userId, data, memberId) => {
     const { service_id, name, description, ...offering } = data;
+    const member = await resolveMember(userId, memberId);
 
     const service = service_id
         ? await prisma.service.findUnique({ where: { id: service_id } })
@@ -528,11 +645,15 @@ const createMyServiceService = async (userId, data) => {
         throw error;
     }
 
+    // El duplicado se mira por MIEMBRO, no por cuenta: en un equipo es normal
+    // que dos personas ofrezcan "Corte de pelo", cada una con su duración y su
+    // precio. Lo que no tiene sentido es que la misma persona lo ofrezca dos
+    // veces.
     const existing = await prisma.professionalService.findFirst({
-        where: { user_id: userId, service_id: service.id },
+        where: { team_member_id: member.id, service_id: service.id },
     });
     if (existing) {
-        const error = new Error('Ya ofrecés ese servicio');
+        const error = new Error('Ese profesional ya ofrece ese servicio');
         error.status = 409;
         throw error;
     }
@@ -541,7 +662,12 @@ const createMyServiceService = async (userId, data) => {
     // (duración, precio, foto, seña); el nombre y la descripción viven en el
     // catálogo compartido.
     return prisma.professionalService.create({
-        data: { ...offering, user_id: userId, service_id: service.id },
+        data: {
+            ...offering,
+            user_id: userId,
+            team_member_id: member.id,
+            service_id: service.id,
+        },
         include: { service: { select: { id: true, name: true, description: true } } },
     });
 };

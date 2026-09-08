@@ -101,7 +101,10 @@ const getAvailability = async (req, res) => {
             return res.status(400).json({ message: 'Datos inválidos', errors: validation.error.issues });
         }
         const { service_id, date } = validation.data;
-        const slots = await getAvailableSlotsService(id, service_id, date);
+        // Con qué profesional del equipo. Va aparte del schema validado porque
+        // es opcional: sin él, el service cae en el dueño de la cuenta, que es
+        // lo que necesita un profesional que trabaja solo.
+        const slots = await getAvailableSlotsService(id, service_id, date, req.query.member_id || undefined);
         res.status(200).json({ message: 'Horarios obtenidos exitosamente', slots });
     } catch (error) {
         res.status(400).json({ message: error.message || 'Error al obtener los horarios' });

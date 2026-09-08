@@ -43,9 +43,16 @@ import {
     deleteMyServiceService,
 } from '../services/panel.service.js';
 
+// A qué profesional del equipo se refiere la operación. Viaja por querystring
+// (?member_id=) incluso en los POST porque es alcance, no contenido: así los
+// schemas de zod del cuerpo quedan igual. Sin el parámetro, el service cae en
+// el dueño de la cuenta, que es lo que hace que una cuenta que trabaja sola no
+// tenga que mandar nada.
+const memberOf = (req) => req.query?.member_id || undefined;
+
 const getMyAvailability = async (req, res) => {
     try {
-        const availability = await getMyAvailabilityService(req.user.sub);
+        const availability = await getMyAvailabilityService(req.user.sub, memberOf(req));
         res.status(200).json({ availability });
     } catch {
         res.status(500).json({ message: 'Error al obtener los horarios' });
@@ -58,7 +65,7 @@ const createAvailability = async (req, res) => {
         return res.status(400).json({ message: 'Datos inválidos', errors: validation.error.issues });
     }
     try {
-        const availability = await createAvailabilityService(req.user.sub, validation.data);
+        const availability = await createAvailabilityService(req.user.sub, validation.data, memberOf(req));
         res.status(201).json({ message: 'Horario creado', availability });
     } catch (error) {
         res.status(error.status || 500).json({ message: error.message || 'Error al crear el horario' });
@@ -72,7 +79,7 @@ const replaceAvailabilityDay = async (req, res) => {
     }
     try {
         const { weekday, ranges } = validation.data;
-        const { availability, conflicts } = await replaceAvailabilityDayService(req.user.sub, weekday, ranges);
+        const { availability, conflicts } = await replaceAvailabilityDayService(req.user.sub, weekday, ranges, memberOf(req));
         res.status(200).json({ message: 'Horario actualizado', availability, conflicts });
     } catch (error) {
         res.status(error.status || 500).json({ message: error.message || 'Error al guardar el horario' });
@@ -347,7 +354,7 @@ const getServiceCatalog = async (req, res) => {
 
 const getMyServices = async (req, res) => {
     try {
-        const services = await getMyServicesService(req.user.sub);
+        const services = await getMyServicesService(req.user.sub, memberOf(req));
         res.status(200).json({ services });
     } catch {
         res.status(500).json({ message: 'Error al obtener tus servicios' });
@@ -360,7 +367,7 @@ const createMyService = async (req, res) => {
         return res.status(400).json({ message: 'Datos inválidos', errors: validation.error.issues });
     }
     try {
-        const service = await createMyServiceService(req.user.sub, validation.data);
+        const service = await createMyServiceService(req.user.sub, validation.data, memberOf(req));
         res.status(201).json({ message: 'Servicio agregado', service });
     } catch (error) {
         res.status(error.status || 500).json({ message: error.message || 'Error al agregar el servicio' });

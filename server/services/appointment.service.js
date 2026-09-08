@@ -1,11 +1,27 @@
 import { prisma } from '../src/lib/prisma.js';
 import { weekdayOf, fitsInWindows, bookingWindow, zonedTime } from '../src/lib/schedule.js';
+import { accessSelect, hasActiveAccess } from '../src/lib/access.js';
 import {
     notificationInclude,
     notifyProfessionalOfBooking,
     notifyClientOfConfirmation,
     notifyInBackground,
 } from './notification.service.js';
+
+// Un profesional sin prueba vigente ni suscripción al día deja de recibir
+// turnos nuevos. Es lo que le da sentido a la suscripción: el link público ES
+// el producto, así que si siguiera tomando reservas no habría motivo para
+// pagar. Lo que ya está reservado no se toca (ver panel.routes.js).
+//
+// El mensaje es neutro a propósito: el que lo lee es el cliente, y que un
+// profesional esté al día con su factura no es asunto suyo.
+const assertAcceptingBookings = (professional) => {
+    if (hasActiveAccess(professional)) return;
+
+    const error = new Error('Este profesional no está recibiendo turnos en este momento');
+    error.status = 409;
+    throw error;
+};
 
 // Reglas de reserva que configura el profesional: cuánta antelación mínima pide
 // y hasta cuándo deja reservar. Se valida acá además de al listar horarios,
@@ -36,11 +52,12 @@ const assertInsideBookingWindow = async (professionalId, startTime) => {
     }
 };
 
-// Corta la operación si el horario pedido no cae dentro de la atención del
-// profesional ese día de la semana (día cerrado, fuera de hora, o un corte).
-const assertInsideWorkingHours = async (professionalId, startTime, endTime) => {
+// Corta la operación si el horario pedido no cae dentro de la atención de ese
+// miembro del equipo ese día de la semana (día cerrado, fuera de hora, o un
+// corte). Se mira la agenda del MIEMBRO: en un equipo cada uno tiene la suya.
+const assertInsideWorkingHours = async (teamMemberId, startTime, endTime) => {
     const windows = await prisma.availability.findMany({
-        where: { user_id: professionalId, weekday: weekdayOf(startTime) },
+        where: { team_member_id: teamMemberId, weekday: weekdayOf(startTime) },
     });
 
     if (!fitsInWindows(startTime, endTime, windows)) {
@@ -54,12 +71,28 @@ const assertInsideWorkingHours = async (professionalId, startTime, endTime) => {
 const createAppointmentService = async (appointmentData) => {
 
 
-    const findProfessionalService = await prisma.professionalService.findFirst({
-        where: {
-            user_id: appointmentData.professional_id,
-            service_id: appointmentData.service_id,
-        }
-    });
+    // El servicio se resuelve por MIEMBRO cuando el pedido lo indica (es lo que
+    // manda el flujo público desde que se elige con quién atenderse) y, si no,
+    // por el dueño de la cuenta. Ese fallback es lo que mantiene andando al
+    // profesional que trabaja solo y a la carga manual desde el panel, que no
+    // tienen que saber nada de equipos.
+    const findProfessionalService = appointmentData.team_member_id
+        ? await prisma.professionalService.findFirst({
+            where: {
+                team_member_id: appointmentData.team_member_id,
+                service_id: appointmentData.service_id,
+            }
+        })
+        : await prisma.professionalService.findFirst({
+            where: {
+                user_id: appointmentData.professional_id,
+                service_id: appointmentData.service_id,
+                // Sin miembro indicado, en un equipo habría varias filas para
+                // el mismo servicio: se elige la del dueño en vez de la
+                // primera que aparezca, que sería impredecible.
+                team_member: { is_owner: true },
+            }
+        });
 
     if (!findProfessionalService) {
         const error = new Error('El profesional no tiene ese servicio');
@@ -75,26 +108,40 @@ const createAppointmentService = async (appointmentData) => {
 
     appointment.professional_service_id = findProfessionalService.id;
     appointment.professional_id = findProfessionalService.user_id;
+    // Se toma del servicio encontrado y no de lo que vino en el pedido: así la
+    // fila nunca puede quedar con un miembro que no sea el dueño de ese
+    // servicio, aunque el cliente mande cualquier cosa.
+    appointment.team_member_id = findProfessionalService.team_member_id;
+
+    // Una sola lectura del profesional para las dos cosas que hacen falta de
+    // él: si sigue recibiendo turnos y si los acepta solo.
+    const professional = await prisma.user.findUnique({
+        where: { id: findProfessionalService.user_id },
+        select: { auto_accept: true, ...accessSelect },
+    });
+
+    // Se chequea antes que el horario para que el mensaje útil sea el primero:
+    // no tiene sentido decirle al cliente "ese horario ya pasó" si de entrada
+    // esta agenda no está tomando reservas.
+    assertAcceptingBookings(professional);
 
     // El turno tiene que entrar entero en una franja de atención. Los horarios
     // que ofrecemos ya salen de ahí, pero esto es lo que impide que alguien
     // reserve en un corte o en un día cerrado mandando el horario a mano.
     await assertInsideBookingWindow(appointment.professional_id, appointment.start_time);
-    await assertInsideWorkingHours(appointment.professional_id, appointment.start_time, appointment.end_time);
+    await assertInsideWorkingHours(appointment.team_member_id, appointment.start_time, appointment.end_time);
 
     // El profesional decide si los turnos entran a la sección de solicitudes
     // (PENDING, hay que aceptarlos) o si se confirman solos.
-    const professional = await prisma.user.findUnique({
-        where: { id: findProfessionalService.user_id },
-        select: { auto_accept: true },
-    });
     appointment.status = professional?.auto_accept ? 'CONFIRMED' : 'PENDING';
 
 
-    //Busco en prisma si existe una cita con el mismo professional id y que este en ese horario
+    // Choque de horarios contra la agenda del MIEMBRO, no la de la cuenta: dos
+    // profesionales del mismo negocio pueden y deben poder atender a la misma
+    // hora. Es la misma condición que aplica la constraint de la base.
     const existingAppointments = await prisma.appointment.findMany({
         where: {
-            professional_id: appointment.professional_id,
+            team_member_id: appointment.team_member_id,
             status: { not: 'CANCELLED' },
             start_time: { lt: appointment.end_time },
             end_time: { gt: appointment.start_time },
@@ -227,19 +274,32 @@ const getProfessionalService = async (id) => {
 }
 
 //obtener horarios disponibles para profesional+servicio+fecha
-const getAvailableSlotsService = async (professionalId, serviceId, dateStr) => {
-    const professionalService = await prisma.professionalService.findFirst({
-        where: {
-            user_id: professionalId,
-            service_id: serviceId,
-        }
-    });
+//
+// `teamMemberId` es opcional: con él se calcula la agenda de esa persona del
+// equipo; sin él se cae en el dueño de la cuenta, que es lo que necesita un
+// profesional que trabaja solo (ver createAppointmentService).
+const getAvailableSlotsService = async (professionalId, serviceId, dateStr, teamMemberId) => {
+    const professionalService = teamMemberId
+        ? await prisma.professionalService.findFirst({
+            where: { team_member_id: teamMemberId, service_id: serviceId },
+        })
+        : await prisma.professionalService.findFirst({
+            where: {
+                user_id: professionalId,
+                service_id: serviceId,
+                team_member: { is_owner: true },
+            },
+        });
 
     if (!professionalService) {
         throw new Error('El profesional no tiene ese servicio');
     }
 
     const { duration } = professionalService;
+    // De acá en adelante todo se calcula contra la agenda del miembro, nunca
+    // la de la cuenta: los horarios de atención y los turnos ya tomados son
+    // suyos, no del negocio entero.
+    const memberId = professionalService.team_member_id;
 
     // El día es el del negocio, no el del server: `dayEnd` se pide como "1440
     // minutos después de la medianoche" en vez de sumar 24 h fijas para que en
@@ -251,7 +311,7 @@ const getAvailableSlotsService = async (professionalId, serviceId, dateStr) => {
 
     const availabilityWindows = await prisma.availability.findMany({
         where: {
-            user_id: professionalId,
+            team_member_id: memberId,
             weekday,
         }
     });
@@ -264,13 +324,21 @@ const getAvailableSlotsService = async (professionalId, serviceId, dateStr) => {
     // antelación mínima y hasta cuándo se puede reservar.
     const settings = await prisma.user.findUnique({
         where: { id: professionalId },
-        select: { min_notice_hours: true, max_days_ahead: true },
+        select: { min_notice_hours: true, max_days_ahead: true, ...accessSelect },
     });
+
+    // Sin acceso no se ofrece ningún horario. El alta igual lo vuelve a
+    // chequear (alguien puede mandar el horario a mano), pero cortar acá evita
+    // mostrarle al cliente una grilla llena de turnos que después van a fallar.
+    if (!hasActiveAccess(settings)) {
+        return [];
+    }
+
     const { from: bookableFrom, until: bookableUntil } = bookingWindow(settings);
 
     const existingAppointments = await prisma.appointment.findMany({
         where: {
-            professional_id: professionalId,
+            team_member_id: memberId,
             status: { not: 'CANCELLED' },
             start_time: { lt: dayEnd },
             end_time: { gt: dayStart },
@@ -303,7 +371,7 @@ const getAvailableSlotsService = async (professionalId, serviceId, dateStr) => {
 
 //obtener un profesional por su slug (link único de reserva) junto con sus servicios
 const getProfessionalBySlugService = async (slug) => {
-    const professional = await prisma.user.findFirst({
+    const found = await prisma.user.findFirst({
         where: { slug, role: 'PROFESSIONAL' },
         select: {
             id: true,
@@ -315,14 +383,23 @@ const getProfessionalBySlugService = async (slug) => {
             // entra al link de reserva.
             image: true,
             description: true,
+            ...accessSelect,
         },
     });
 
-    if (!professional) {
+    if (!found) {
         const error = new Error('No encontramos a ese profesional');
         error.status = 404;
         throw error;
     }
+
+    // Este endpoint es público: lo abre cualquiera con el link, sin sesión. Los
+    // campos de suscripción se usan para calcular el flag y se sacan de la
+    // respuesta — en qué anda un profesional con su factura no es información
+    // del cliente. Sale solo el "sí o no" que la página necesita para decidir
+    // si muestra los servicios o el aviso.
+    const { subscription_status, trial_ends_at, ...professional } = found;
+    professional.accepting_bookings = hasActiveAccess(found);
 
     const services = await getProfessionalService(professional.id);
 

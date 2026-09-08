@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../src/lib/prisma.js';
 import { notifyPasswordReset, notifyMagicLink, notifyInBackground } from './notification.service.js';
+import { accessSelect, getAccessState, trialEndsAt } from '../src/lib/access.js';
 
 const RESET_TOKEN_HOURS = 1;
 // Más corto que el de contraseña: el link mágico es la sesión misma, no un paso
@@ -24,6 +25,28 @@ const userSelect = {
     role: true,
     slug: true,
     onboarding_completed: true,
+    // Para poder calcular el acceso sin una segunda consulta. No salen crudos
+    // al front: los reemplaza el objeto `access` que arma withAccess.
+    ...accessSelect,
+};
+
+// Le agrega al usuario el estado de acceso ya resuelto, para que el front no
+// tenga que reimplementar la regla (y no se le pueda desincronizar).
+//
+// Solo tiene sentido para un profesional: un cliente no tiene prueba ni
+// suscripción, y devolverle un `access.active: false` haría que cualquier
+// pantalla que mire ese campo lo trate como vencido. Por eso va en null.
+const withAccess = (user) => {
+    if (!user) return user;
+
+    const { subscription_status, trial_ends_at, ...rest } = user;
+
+    return {
+        ...rest,
+        access: user.role === 'PROFESSIONAL'
+            ? getAccessState({ subscription_status, trial_ends_at })
+            : null,
+    };
 };
 
 function signToken(user) {
@@ -76,12 +99,27 @@ const registerService = async ({ password, ...data }) => {
             password: hashedPassword,
             role: 'PROFESSIONAL',
             slug: await generateUniqueSlug(data.firts_name, data.last_name),
+            // La prueba arranca al crear la cuenta, no al terminar el
+            // onboarding: si arrancara después, alguien que nunca lo completa
+            // se queda con la cuenta abierta para siempre.
+            trial_ends_at: trialEndsAt(),
+            // Su ficha de profesional, creada en el mismo insert. Toda la
+            // agenda (horarios, servicios, turnos) cuelga de un miembro del
+            // equipo, así que una cuenta sin este registro no puede cargar
+            // absolutamente nada: el equipo de uno es el caso normal, no la
+            // excepción.
+            team: {
+                create: {
+                    name: `${data.firts_name} ${data.last_name}`.trim() || 'Profesional',
+                    is_owner: true,
+                },
+            },
         },
         select: userSelect,
     });
 
     const token = signToken(user);
-    return { user, token };
+    return { user: withAccess(user), token };
 };
 
 const loginService = async ({ email, password }) => {
@@ -101,11 +139,12 @@ const loginService = async ({ email, password }) => {
 
     const safeUser = await prisma.user.findUnique({ where: { id: user.id }, select: userSelect });
     const token = signToken(user);
-    return { user: safeUser, token };
+    return { user: withAccess(safeUser), token };
 };
 
 const getUserByIdService = async (id) => {
-    return prisma.user.findUnique({ where: { id }, select: userSelect });
+    const user = await prisma.user.findUnique({ where: { id }, select: userSelect });
+    return withAccess(user);
 };
 
 // Arranca la recuperación. No devuelve nada ni distingue casos a propósito: el
@@ -224,7 +263,10 @@ const verifyMagicLinkService = async (token) => {
         select: userSelect,
     });
 
-    return { user: safeUser, token: signToken(safeUser) };
+    // withAccess acá siempre deja `access` en null (el link mágico es solo para
+    // clientes), pero se aplica igual para que ningún camino devuelva los
+    // campos crudos de suscripción que userSelect ahora trae.
+    return { user: withAccess(safeUser), token: signToken(safeUser) };
 };
 
 export {

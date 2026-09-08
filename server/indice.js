@@ -7,7 +7,6 @@ import { professionalsRouter } from './routes/professionals.routes.js';
 import { clientsRouter } from './routes/clients.routes.js';
 import { authRouter } from './routes/auth.routes.js';
 import { panelRouter } from './routes/panel.routes.js';
-import { billingRouter } from './routes/billing.routes.js';
 
 // Sin estas variables el server no sirve para nada: sin JWT_SECRET no se puede
 // firmar ni verificar un token, y sin DATABASE_CONNECTION no hay base. Mejor no
@@ -92,10 +91,7 @@ app.use('/auth/reset-password', authLimiter);
 // apuntable a cualquier cliente.
 app.use('/auth/magic-link', authLimiter);
 app.use('/clients', bookingLimiter);
-// Crear una suscripción es un pedido a la API de Mercado Pago por cada llamada:
-// sin límite, alguien logueado puede usarnos para martillarles la API. El
-// webhook queda afuera a propósito (lo llama MP, y puede venir en ráfaga).
-app.use('/billing/subscribe', authLimiter);
+
 // De /appointments solo el POST es público; el resto pide token y lo usa gente
 // logueada mirando sus turnos.
 app.use('/appointments', (req, res, next) =>
@@ -122,9 +118,7 @@ app.use('/auth', authRouter);
 // Panel del profesional (gestionar disponibilidad y servicios propios)
 app.use('/panel', panelRouter);
 
-// Suscripciones de Mercado Pago (planes de los profesionales) y el webhook con
-// el que MP nos avisa de los cambios de estado.
-app.use('/billing', billingRouter);
+
 
 // Una ruta que no existe también contesta JSON. Antes caía en el manejador por
 // defecto de Express, que devuelve HTML, y el front tenía que adivinar.

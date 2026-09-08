@@ -19,8 +19,17 @@ model appointment {
   client_id String @db.Uuid
   client    user   @relation("ClientAppointments", fields: [client_id], references: [id])
 
+  // La cuenta que recibe el turno (ver availability.user_id sobre por qué se
+  // guardan los dos). El panel lista por acá; la agenda real es la del miembro.
   professional_id String @db.Uuid
   professional    user   @relation("ProfessionalAppointments", fields: [professional_id], references: [id])
+
+  // Quién atiende. Es el campo sobre el que corre la constraint de
+  // superposición: si estuviera sobre la cuenta, dos miembros del mismo negocio
+  // no podrían tener turnos a la misma hora, que es justo lo que un equipo
+  // necesita poder hacer.
+  team_member_id String     @db.Uuid
+  team_member    TeamMember @relation(fields: [team_member_id], references: [id])
 
   start_time DateTime
   end_time   DateTime
@@ -44,8 +53,15 @@ model service {
 
 model ProfessionalService {
   id           String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // La cuenta dueña del servicio (ver el comentario de availability.user_id
+  // sobre por qué se guardan los dos).
   user_id      String        @db.Uuid
   user         user          @relation(fields: [user_id], references: [id])
+  // Qué miembro presta este servicio. Dos miembros de la misma cuenta pueden
+  // ofrecer el mismo `service` con precio y duración distintos: son filas
+  // separadas, cada una con su team_member_id.
+  team_member_id String      @db.Uuid
+  team_member    TeamMember  @relation(fields: [team_member_id], references: [id])
   service_id   String        @db.Uuid
   service      service       @relation(fields: [service_id], references: [id])
   duration     Int
@@ -116,6 +132,12 @@ model user {
   // pedirle a MP en cada carga de página: sin esto, la resincronización al
   // leer sería una llamada a su API por cada vez que alguien abre Cuenta.
   subscription_synced_at    DateTime?
+  // Prueba gratis: hasta esta fecha la cuenta funciona entera sin haber pagado.
+  // Es la otra mitad del permiso, junto con subscription_status: la regla que
+  // combina las dos vive en un solo lugar (src/lib/access.js) para que no se
+  // repita en cada ruta. Nullable porque una cuenta de cliente (role USER)
+  // nunca tiene prueba: no hay nada que probar.
+  trial_ends_at             DateTime?
   // Mientras esté en false, al profesional se lo manda al onboarding en vez del
   // panel. Las cuentas que ya existían quedaron en true en la migración.
   onboarding_completed Boolean       @default(false)
@@ -132,8 +154,17 @@ model user {
 
 model availability {
   id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // La cuenta. Se conserva además del miembro porque el panel pregunta todo el
+  // tiempo "todo lo de mi cuenta", y tenerlo en la fila evita un join contra
+  // TeamMember en cada una de esas consultas. La contra es que los dos campos
+  // podrían quedar desalineados: que `team_member_id` sea de otra cuenta. Lo
+  // impide el service, que resuelve el miembro con findOwnTeamMember antes de
+  // escribir nada (mismo patrón de ownership que el resto del panel).
   user_id       String   @db.Uuid
   user          user     @relation(fields: [user_id], references: [id])
+  // Quién atiende en esa franja.
+  team_member_id String  @db.Uuid
+  team_member    TeamMember @relation(fields: [team_member_id], references: [id])
   weekday       Int // 0=domingo ... 6=sábado, igual que Date.prototype.getDay()
   start_minutes Int // minutos desde medianoche, ej. 9:00 = 540
   end_minutes   Int // ej. 18:00 = 1080
@@ -141,11 +172,17 @@ model availability {
   updated_at    DateTime @updatedAt @db.Timestamp(6)
 
   @@index([user_id, weekday])
+  @@index([team_member_id, weekday])
 }
 
-// El equipo que el dueño de la cuenta muestra como suyo. Ojo con el nombre: en
-// la UI son "los profesionales", pero no son usuarios ni tienen agenda propia
-// (los turnos siguen siendo de la cuenta). Por ahora son datos de presentación.
+// Cada profesional que atiende dentro de una cuenta. NO es un usuario: no tiene
+// login ni contraseña, lo administra entero el dueño de la cuenta desde su
+// panel (decidido con el usuario el 2026-08-07). Lo que sí tiene es agenda
+// propia: horarios, servicios y turnos cuelgan del miembro, no de la cuenta.
+//
+// El dueño de la cuenta es él mismo un miembro (`is_owner`), así que un
+// profesional que trabaja solo es simplemente un equipo de uno. Eso evita
+// tener dos caminos de código para "cuenta con equipo" y "cuenta sin equipo".
 model TeamMember {
   id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   account_id  String   @db.Uuid
@@ -154,8 +191,21 @@ model TeamMember {
   description String?
   // Foto como data URL (base64), igual que la de los servicios.
   image       String?
+  // El miembro que representa al titular de la cuenta. No se puede dar de baja
+  // (si se fuera, la cuenta quedaría sin nadie que atienda) y es al que se le
+  // migró la agenda que antes colgaba del user.
+  is_owner    Boolean  @default(false)
+  // Baja lógica. Un profesional que ya atendió no se puede borrar de verdad:
+  // sus turnos son historial del negocio y la FK es RESTRICT. Al darlo de baja
+  // desaparece del link público y de los selectores del panel, sus turnos
+  // pasados siguen donde estaban, y deja de contar para el límite del plan.
+  is_active   Boolean  @default(true)
   created_at  DateTime @default(now()) @db.Timestamp(6)
   updated_at  DateTime @updatedAt @db.Timestamp(6)
+
+  availability availability[]
+  services     ProfessionalService[]
+  appointments appointment[]
 
   @@index([account_id])
 }
